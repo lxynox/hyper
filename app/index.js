@@ -2,12 +2,29 @@
 if (['--help', '-v', '--version'].includes(process.argv[1])) {
   const {version} = require('./package');
   const configLocation = process.platform === 'win32' ? process.env.userprofile + '\\.hyper.js' : '~/.hyper.js';
+  //eslint-disable-next-line no-console
   console.log(`Hyper version ${version}`);
+  //eslint-disable-next-line no-console
   console.log('Hyper does not accept any command line arguments. Please modify the config file instead.');
+  //eslint-disable-next-line no-console
   console.log(`Hyper configuration file located at: ${configLocation}`);
   // eslint-disable-next-line unicorn/no-process-exit
   process.exit();
 }
+
+const checkSquirrel = () => {
+  let squirrel;
+
+  try {
+    squirrel = require('electron-squirrel-startup');
+    //eslint-disable-next-line no-empty
+  } catch (err) {}
+
+  if (squirrel) {
+    // eslint-disable-next-line unicorn/no-process-exit
+    process.exit();
+  }
+};
 
 // handle startup squirrel events
 if (process.platform === 'win32') {
@@ -18,51 +35,37 @@ if (process.platform === 'win32') {
     case '--squirrel-install':
     case '--squirrel-updated':
       systemContextMenu.add(() => {
-        // eslint-disable-next-line curly, unicorn/no-process-exit
-        if (require('electron-squirrel-startup')) process.exit();
+        checkSquirrel();
       });
       break;
     case '--squirrel-uninstall':
       systemContextMenu.remove(() => {
-        // eslint-disable-next-line curly, unicorn/no-process-exit
-        if (require('electron-squirrel-startup')) process.exit();
+        checkSquirrel();
       });
       break;
     default:
-      // eslint-disable-next-line curly, unicorn/no-process-exit
-      if (require('electron-squirrel-startup')) process.exit();
+      checkSquirrel();
   }
 }
 
 // Native
-const {resolve, isAbsolute} = require('path');
-const {homedir} = require('os');
+const {resolve} = require('path');
 
 // Packages
-const {parse: parseUrl} = require('url');
-const {app, BrowserWindow, shell, Menu} = require('electron');
+const {app, BrowserWindow, Menu} = require('electron');
 const {gitDescribe} = require('git-describe');
-const uuid = require('uuid');
-const fileUriToPath = require('file-uri-to-path');
 const isDev = require('electron-is-dev');
 
-// Ours
-const AutoUpdater = require('./auto-updater');
-const toElectronBackgroundColor = require('./utils/to-electron-background-color');
-const createMenu = require('./menu');
-const createRPC = require('./rpc');
-const notify = require('./notify');
-const fetchNotifications = require('./notifications');
-
-app.commandLine.appendSwitch('js-flags', '--harmony');
-
-// set up config
 const config = require('./config');
 
-config.init();
+// set up config
+config.setup();
 
 const plugins = require('./plugins');
-const Session = require('./session');
+const {addSymlink, addBinToUserPath} = require('./utils/cli-install');
+const AppMenu = require('./menus/menu');
+const Window = require('./ui/window');
+const windowUtils = require('./utils/window-utils');
 
 const windowSet = new Set([]);
 
@@ -83,6 +86,7 @@ app.getLastFocusedWindow = () => {
 };
 
 if (isDev) {
+  //eslint-disable-next-line no-console
   console.log('running in dev mode');
 
   // Overide default appVersion which is set from package.json
@@ -92,340 +96,144 @@ if (isDev) {
     }
   });
 } else {
+  //eslint-disable-next-line no-console
   console.log('running in prod mode');
+  if (process.platform === 'win32') {
+    //eslint-disable-next-line no-console
+    addBinToUserPath().catch(err => console.error('Failed to add Hyper CLI path to user PATH', err));
+  } else {
+    //eslint-disable-next-line no-console
+    addSymlink().catch(err => console.error('Failed to symlink Hyper CLI', err));
+  }
 }
 
-const url = 'file://' + resolve(
-  isDev ? __dirname : app.getAppPath(),
-  'index.html'
-);
-
+const url = 'file://' + resolve(isDev ? __dirname : app.getAppPath(), 'index.html');
+//eslint-disable-next-line no-console
 console.log('electron will open', url);
 
-app.on('ready', () => installDevExtensions(isDev).then(() => {
-  function createWindow(fn, options = {}) {
-    let cfg = plugins.getDecoratedConfig();
+app.on('ready', () =>
+  installDevExtensions(isDev)
+    .then(() => {
+      function createWindow(fn, options = {}) {
+        const cfg = plugins.getDecoratedConfig();
 
-    const winSet = app.config.window.get();
-    let [startX, startY] = winSet.position;
+        const winSet = config.getWin();
+        let [startX, startY] = winSet.position;
 
-    const [width, height] = options.size ? options.size : (cfg.windowSize || winSet.size);
-    const {screen} = require('electron');
+        const [width, height] = options.size ? options.size : cfg.windowSize || winSet.size;
+        const {screen} = require('electron');
 
-    const winPos = options.position;
+        const winPos = options.position;
 
-    // Open the new window roughly the height of the header away from the
-    // previous window. This also ensures in multi monitor setups that the
-    // new terminal is on the correct screen.
-    const focusedWindow = BrowserWindow.getFocusedWindow() || app.getLastFocusedWindow();
-    // In case of options defaults position and size, we should ignore the focusedWindow.
-    if (winPos !== undefined) {
-      [startX, startY] = winPos;
-    } else if (focusedWindow) {
-      const points = focusedWindow.getPosition();
-      const currentScreen = screen.getDisplayNearestPoint({x: points[0], y: points[1]});
+        // Open the new window roughly the height of the header away from the
+        // previous window. This also ensures in multi monitor setups that the
+        // new terminal is on the correct screen.
+        const focusedWindow = BrowserWindow.getFocusedWindow() || app.getLastFocusedWindow();
+        // In case of options defaults position and size, we should ignore the focusedWindow.
+        if (winPos !== undefined) {
+          [startX, startY] = winPos;
+        } else if (focusedWindow) {
+          const points = focusedWindow.getPosition();
+          const currentScreen = screen.getDisplayNearestPoint({
+            x: points[0],
+            y: points[1]
+          });
 
-      const biggestX = ((points[0] + 100 + width) - currentScreen.bounds.x);
-      const biggestY = ((points[1] + 100 + height) - currentScreen.bounds.y);
+          const biggestX = points[0] + 100 + width - currentScreen.bounds.x;
+          const biggestY = points[1] + 100 + height - currentScreen.bounds.y;
 
-      if (biggestX > currentScreen.size.width) {
-        startX = 50;
-      } else {
-        startX = points[0] + 34;
-      }
-      if (biggestY > currentScreen.size.height) {
-        startY = 50;
-      } else {
-        startY = points[1] + 34;
-      }
-    }
+          if (biggestX > currentScreen.size.width) {
+            startX = 50;
+          } else {
+            startX = points[0] + 34;
+          }
+          if (biggestY > currentScreen.size.height) {
+            startY = 50;
+          } else {
+            startY = points[1] + 34;
+          }
+        }
 
-    const browserDefaults = {
-      width,
-      height,
-      minHeight: 190,
-      minWidth: 370,
-      titleBarStyle: 'hidden-inset', // macOS only
-      title: 'Hyper.app',
-      backgroundColor: toElectronBackgroundColor(cfg.backgroundColor || '#000'),
-      // we want to go frameless on windows and linux
-      frame: process.platform === 'darwin',
-      transparent: process.platform === 'darwin',
-      icon: resolve(__dirname, 'static/icon.png'),
-      // we only want to show when the prompt is ready for user input
-      // HYPERTERM_DEBUG for backwards compatibility with hyperterm
-      show: process.env.HYPER_DEBUG || process.env.HYPERTERM_DEBUG || isDev,
-      x: startX,
-      y: startY,
-      acceptFirstMouse: true
-    };
-    const browserOptions = plugins.getDecoratedBrowserOptions(browserDefaults);
+        if (!windowUtils.positionIsValid([startX, startY])) {
+          [startX, startY] = config.windowDefaults.windowPosition;
+        }
 
-    const win = new BrowserWindow(browserOptions);
-    windowSet.add(win);
+        const hwin = new Window({width, height, x: startX, y: startY}, cfg, fn);
+        windowSet.add(hwin);
+        hwin.loadURL(url);
 
-    win.loadURL(url);
-
-    const rpc = createRPC(win);
-    const sessions = new Map();
-
-    // config changes
-    const cfgUnsubscribe = config.subscribe(() => {
-      const cfg_ = plugins.getDecoratedConfig();
-
-      // notify renderer
-      win.webContents.send('config change');
-
-      // notify user that shell changes require new sessions
-      if (cfg_.shell !== cfg.shell ||
-        JSON.stringify(cfg_.shellArgs) !== JSON.stringify(cfg.shellArgs)) {
-        notify(
-          'Shell configuration changed!',
-          'Open a new tab or window to start using the new shell'
-        );
-      }
-
-      // update background color if necessary
-      cfg = cfg_;
-    });
-
-    rpc.on('init', () => {
-      // we update the backgroundColor once the init is called.
-      // when we do a win.reload() we need need to reset the backgroundColor
-      win.setBackgroundColor(toElectronBackgroundColor(cfg.backgroundColor || '#000'));
-      win.show();
-
-      // If no callback is passed to createWindow,
-      // a new session will be created by default.
-      if (!fn) {
-        fn = win => win.rpc.emit('termgroup add req');
-      }
-
-      // app.windowCallback is the createWindow callback
-      // that can be set before the 'ready' app event
-      // and createWindow deifinition. It's executed in place of
-      // the callback passed as parameter, and deleted right after.
-      (app.windowCallback || fn)(win);
-      delete (app.windowCallback);
-
-      fetchNotifications(win);
-      // auto updates
-      if (!isDev && process.platform !== 'linux') {
-        AutoUpdater(win);
-      } else {
-        console.log('ignoring auto updates during dev');
-      }
-    });
-
-    rpc.on('new', ({rows = 40, cols = 100, cwd = process.argv[1] && isAbsolute(process.argv[1]) ? process.argv[1] : homedir(), splitDirection}) => {
-      const shell = cfg.shell;
-      const shellArgs = cfg.shellArgs && Array.from(cfg.shellArgs);
-
-      initSession({rows, cols, cwd, shell, shellArgs}, (uid, session) => {
-        sessions.set(uid, session);
-        rpc.emit('session add', {
-          rows,
-          cols,
-          uid,
-          splitDirection,
-          shell: session.shell,
-          pid: session.pty.pid
+        // the window can be closed by the browser process itself
+        hwin.on('close', () => {
+          hwin.clean();
+          windowSet.delete(hwin);
         });
 
-        session.on('data', data => {
-          rpc.emit('session data', uid + data);
+        hwin.on('closed', () => {
+          if (process.platform !== 'darwin' && windowSet.size === 0) {
+            app.quit();
+          }
         });
 
-        session.on('exit', () => {
-          rpc.emit('session exit', {uid});
-          sessions.delete(uid);
-        });
-      });
-    });
-
-    rpc.on('exit', ({uid}) => {
-      const session = sessions.get(uid);
-      if (session) {
-        session.exit();
-      } else {
-        console.log('session not found by', uid);
+        return hwin;
       }
-    });
 
-    rpc.on('unmaximize', () => {
-      win.unmaximize();
-    });
-
-    rpc.on('maximize', () => {
-      win.maximize();
-    });
-
-    rpc.on('resize', ({uid, cols, rows}) => {
-      const session = sessions.get(uid);
-      session.resize({cols, rows});
-    });
-
-    rpc.on('data', ({uid, data}) => {
-      sessions.get(uid).write(data);
-    });
-
-    rpc.on('open external', ({url}) => {
-      shell.openExternal(url);
-    });
-
-    rpc.win.on('move', () => {
-      rpc.emit('move');
-    });
-
-    rpc.on('open hamburger menu', ({x, y}) => {
-      Menu.getApplicationMenu().popup(x, y);
-    });
-
-    rpc.on('minimize', () => {
-      win.minimize();
-    });
-
-    rpc.on('close', () => {
-      win.close();
-    });
-
-    const deleteSessions = () => {
-      sessions.forEach((session, key) => {
-        session.removeAllListeners();
-        session.destroy();
-        sessions.delete(key);
-      });
-    };
-
-    // we reset the rpc channel only upon
-    // subsequent refreshes (ie: F5)
-    let i = 0;
-    win.webContents.on('did-navigate', () => {
-      if (i++) {
-        deleteSessions();
-      }
-    });
-
-    // If file is dropped onto the terminal window, navigate event is prevented
-    // and his path is added to active session.
-    win.webContents.on('will-navigate', (event, url) => {
-      const protocol = typeof url === 'string' && parseUrl(url).protocol;
-      if (protocol === 'file:') {
-        event.preventDefault();
-        const path = fileUriToPath(url).replace(/ /g, '\\ ');
-        rpc.emit('session data send', {data: path});
-      } else if (protocol === 'http:' || protocol === 'https:') {
-        event.preventDefault();
-        rpc.emit('session data send', {data: url});
-      }
-    });
-
-    // expose internals to extension authors
-    win.rpc = rpc;
-    win.sessions = sessions;
-
-    const load = () => {
-      plugins.onWindow(win);
-    };
-
-    // load plugins
-    load();
-
-    const pluginsUnsubscribe = plugins.subscribe(err => {
-      if (!err) {
-        load();
-        win.webContents.send('plugins change');
-      }
-    });
-
-    // Keep track of focus time of every window, to figure out
-    // which one of the existing window is the last focused.
-    // Works nicely even if a window is closed and removed.
-    const updateFocusTime = () => {
-      win.focusTime = process.uptime();
-    };
-    win.on('focus', () => {
-      updateFocusTime();
-    });
-    // Ensure focusTime is set on window open. The focus event doesn't
-    // fire from the dock (see bug #583)
-    updateFocusTime();
-
-    // the window can be closed by the browser process itself
-    win.on('close', () => {
-      app.config.window.recordState(win);
-      windowSet.delete(win);
-      rpc.destroy();
-      deleteSessions();
-      cfgUnsubscribe();
-      pluginsUnsubscribe();
-    });
-
-    // Same deal as above, grabbing the window titlebar when the window
-    // is maximized on Windows results in unmaximize, without hitting any
-    // app buttons
-    for (const ev of ['maximize', 'unmaximize', 'minimize', 'restore']) {
-      win.on(ev, () => rpc.emit('windowGeometry change'));
-    }
-
-    win.on('closed', () => {
-      if (process.platform !== 'darwin' && windowSet.size === 0) {
-        app.quit();
-      }
-    });
-  }
-
-  // when opening create a new window
-  createWindow();
-
-  // expose to plugins
-  app.createWindow = createWindow;
-
-  // mac only. when the dock icon is clicked
-  // and we don't have any active windows open,
-  // we open one
-  app.on('activate', () => {
-    if (!windowSet.size) {
+      // when opening create a new window
       createWindow();
-    }
-  });
 
-  const setupMenu = () => {
-    const tpl = plugins.decorateMenu(createMenu({
-      createWindow,
-      updatePlugins: () => {
-        plugins.updatePlugins({force: true});
+      // expose to plugins
+      app.createWindow = createWindow;
+
+      if (!isDev) {
+        // check if should be set/removed as default ssh protocol client
+        if (config.getConfig().defaultSSHApp && !app.isDefaultProtocolClient('ssh')) {
+          //eslint-disable-next-line no-console
+          console.log('Setting Hyper as default client for ssh:// protocol');
+          app.setAsDefaultProtocolClient('ssh');
+        } else if (!config.getConfig().defaultSSHApp && app.isDefaultProtocolClient('ssh')) {
+          //eslint-disable-next-line no-console
+          console.log('Removing Hyper from default client for ssh:// protocl');
+          app.removeAsDefaultProtocolClient('ssh');
+        }
       }
-    }));
 
-    // If we're on Mac make a Dock Menu
-    if (process.platform === 'darwin') {
-      const dockMenu = Menu.buildFromTemplate([{
-        label: 'New Window',
-        click() {
+      // mac only. when the dock icon is clicked
+      // and we don't have any active windows open,
+      // we open one
+      app.on('activate', () => {
+        if (!windowSet.size) {
           createWindow();
         }
-      }]);
-      app.dock.setMenu(dockMenu);
-    }
+      });
 
-    Menu.setApplicationMenu(Menu.buildFromTemplate(tpl));
-  };
+      const makeMenu = () => {
+        const menu = plugins.decorateMenu(AppMenu.createMenu(createWindow, plugins.getLoadedPluginVersions));
 
-  const load = () => {
-    plugins.onApp(app);
-    setupMenu();
-  };
+        // If we're on Mac make a Dock Menu
+        if (process.platform === 'darwin') {
+          const dockMenu = Menu.buildFromTemplate([
+            {
+              label: 'New Window',
+              click() {
+                createWindow();
+              }
+            }
+          ]);
+          app.dock.setMenu(dockMenu);
+        }
 
-  load();
-  plugins.subscribe(load);
-}).catch(err => {
-  console.error('Error while loading devtools extensions', err);
-}));
+        Menu.setApplicationMenu(AppMenu.buildMenu(menu));
+      };
 
-function initSession(opts, fn) {
-  fn(uuid.v4(), new Session(opts));
-}
+      plugins.onApp(app);
+      makeMenu();
+      plugins.subscribe(plugins.onApp.bind(undefined, app));
+      config.subscribe(makeMenu);
+    })
+    .catch(err => {
+      //eslint-disable-next-line no-console
+      console.error('Error while loading devtools extensions', err);
+    })
+);
 
 app.on('open-file', (event, path) => {
   const lastWindow = app.getLastFocusedWindow();
@@ -441,17 +249,28 @@ app.on('open-file', (event, path) => {
   }
 });
 
-function installDevExtensions(isDev) {
-  if (!isDev) {
+app.on('open-url', (event, sshUrl) => {
+  const lastWindow = app.getLastFocusedWindow();
+  const callback = win => win.rpc.emit('open ssh', sshUrl);
+  if (lastWindow) {
+    callback(lastWindow);
+  } else if (!lastWindow && {}.hasOwnProperty.call(app, 'createWindow')) {
+    app.createWindow(callback);
+  } else {
+    // If createWindow doesn't exist yet ('ready' event was not fired),
+    // sets his callback to an app.windowCallback property.
+    app.windowCallback = callback;
+  }
+});
+
+function installDevExtensions(isDev_) {
+  if (!isDev_) {
     return Promise.resolve();
   }
   // eslint-disable-next-line import/no-extraneous-dependencies
   const installer = require('electron-devtools-installer');
 
-  const extensions = [
-    'REACT_DEVELOPER_TOOLS',
-    'REDUX_DEVTOOLS'
-  ];
+  const extensions = ['REACT_DEVELOPER_TOOLS', 'REDUX_DEVTOOLS'];
   const forceDownload = Boolean(process.env.UPGRADE_EXTENSIONS);
 
   return Promise.all(extensions.map(name => installer.default(installer[name], forceDownload)));

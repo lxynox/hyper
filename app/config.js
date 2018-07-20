@@ -1,158 +1,154 @@
-const {homedir} = require('os');
-const {statSync, renameSync, readFileSync, writeFileSync} = require('fs');
-const {resolve} = require('path');
-const vm = require('vm');
-
-const {dialog} = require('electron');
-const isDev = require('electron-is-dev');
-const gaze = require('gaze');
-const Config = require('electron-config');
+const fs = require('fs');
 const notify = require('./notify');
-
-// local storage
-const winCfg = new Config({
-  defaults: {
-    windowPosition: [50, 50],
-    windowSize: [540, 380]
-  }
-});
-
-let configDir = homedir();
-if (isDev) {
-  // if a local config file exists, use it
-  try {
-    const devDir = resolve(__dirname, '..');
-    const devConfig = resolve(devDir, '.hyper.js');
-    statSync(devConfig);
-    configDir = devDir;
-    console.log('using config file:', devConfig);
-  } catch (err) {
-    // ignore
-  }
-}
-
-const path = resolve(configDir, '.hyper.js');
-const pathLegacy = resolve(configDir, '.hyperterm.js');
+const {_import, getDefaultConfig} = require('./config/import');
+const _openConfig = require('./config/open');
+const win = require('./config/windows');
+const {cfgPath, cfgDir} = require('./config/paths');
+const {getColorMap} = require('./utils/colors');
 
 const watchers = [];
-
 let cfg = {};
+let _watcher;
 
-function watch() {
-  // watch for changes on config every 2s
-  gaze(path, {interval: 2000}, function (err) {
-    if (err) {
-      throw err;
-    }
-    this.on('changed', () => {
-      try {
-        if (exec(readFileSync(path, 'utf8'))) {
-          notify('Hyper configuration reloaded!');
-          watchers.forEach(fn => fn());
-        }
-      } catch (err) {
-        dialog.showMessageBox({
-          message: `An error occurred loading your configuration (${path}): ${err.message}`,
-          buttons: ['Ok']
-        });
+const _watch = function() {
+  if (_watcher) {
+    return _watcher;
+  }
+
+  const onChange = () => {
+    // Need to wait 100ms to ensure that write is complete
+    setTimeout(() => {
+      cfg = _import();
+      notify('Configuration updated', 'Hyper configuration reloaded!');
+      watchers.forEach(fn => fn());
+      checkDeprecatedConfig();
+    }, 100);
+  };
+
+  // Windows
+  if (process.platform === 'win32') {
+    // watch for changes on config every 2s on Windows
+    // https://github.com/zeit/hyper/pull/1772
+    _watcher = fs.watchFile(cfgPath, {interval: 2000}, (curr, prev) => {
+      if (curr.mtime === 0) {
+        //eslint-disable-next-line no-console
+        console.error('error watching config');
+      } else if (curr.mtime !== prev.mtime) {
+        onChange();
       }
     });
-    this.on('error', () => {
-      // Ignore file watching errors
+    return;
+  }
+  // macOS/Linux
+  setWatcher();
+  function setWatcher() {
+    try {
+      _watcher = fs.watch(cfgPath, eventType => {
+        if (eventType === 'rename') {
+          _watcher.close();
+          // Ensure that new file has been written
+          setTimeout(() => setWatcher(), 500);
+        }
+      });
+    } catch (e) {
+      //eslint-disable-next-line no-console
+      console.error('Failed to watch config file:', cfgPath, e);
+      return;
+    }
+    _watcher.on('change', onChange);
+    _watcher.on('error', error => {
+      //eslint-disable-next-line no-console
+      console.error('error watching config', error);
     });
-  });
-}
-
-let _str; // last script
-function exec(str) {
-  if (str === _str) {
-    return false;
   }
-  _str = str;
-  const script = new vm.Script(str);
-  const module = {};
-  script.runInNewContext({module});
-  if (!module.exports) {
-    throw new Error('Error reading configuration: `module.exports` not set');
-  }
-  const _cfg = module.exports;
-  if (!_cfg.config) {
-    throw new Error('Error reading configuration: `config` key is missing');
-  }
-  _cfg.plugins = _cfg.plugins || [];
-  _cfg.localPlugins = _cfg.localPlugins || [];
-  cfg = _cfg;
-  return true;
-}
+};
 
-// This method will take text formatted as Unix line endings and transform it
-// to text formatted with DOS line endings. We do this because the default
-// text editor on Windows (notepad) doesn't Deal with LF files. Still. In 2017.
-function crlfify(str) {
-  return str.replace(/\r?\n/g, '\r\n');
-}
-
-exports.subscribe = function (fn) {
+exports.subscribe = fn => {
   watchers.push(fn);
   return () => {
     watchers.splice(watchers.indexOf(fn), 1);
   };
 };
 
-exports.init = function () {
-  // for backwards compatibility with hyperterm
-  // (prior to the rename), we try to rename
-  // on behalf of the user
-  try {
-    statSync(pathLegacy);
-    renameSync(pathLegacy, path);
-  } catch (err) {
-    // ignore
-  }
-
-  try {
-    exec(readFileSync(path, 'utf8'));
-  } catch (err) {
-    console.log('read error', path, err.message);
-    const defaultConfig = readFileSync(resolve(__dirname, 'config-default.js'));
-    try {
-      console.log('attempting to write default config to', path);
-      exec(defaultConfig);
-
-      writeFileSync(
-        path,
-        process.platform === 'win32' ? crlfify(defaultConfig.toString()) : defaultConfig);
-    } catch (err) {
-      throw new Error(`Failed to write config to ${path}: ${err.message}`);
-    }
-  }
-  watch();
-};
-
-exports.getConfigDir = function () {
+exports.getConfigDir = () => {
   // expose config directory to load plugin from the right place
-  return configDir;
+  return cfgDir;
 };
 
-exports.getConfig = function () {
+exports.getConfig = () => {
   return cfg.config;
 };
 
-exports.getPlugins = function () {
+exports.openConfig = () => {
+  return _openConfig();
+};
+
+exports.getPlugins = () => {
   return {
     plugins: cfg.plugins,
     localPlugins: cfg.localPlugins
   };
 };
 
-exports.window = {
-  get() {
-    const position = winCfg.get('windowPosition');
-    const size = winCfg.get('windowSize');
-    return {position, size};
-  },
-  recordState(win) {
-    winCfg.set('windowPosition', win.getPosition());
-    winCfg.set('windowSize', win.getSize());
+exports.getKeymaps = () => {
+  return cfg.keymaps;
+};
+
+exports.setup = () => {
+  cfg = _import();
+  _watch();
+  checkDeprecatedConfig();
+};
+
+exports.getWin = win.get;
+exports.winRecord = win.recordState;
+exports.windowDefaults = win.defaults;
+
+const getDeprecatedCSS = function(config) {
+  const deprecated = [];
+  const deprecatedCSS = ['x-screen', 'x-row', 'cursor-node', '::selection'];
+  deprecatedCSS.forEach(css => {
+    if ((config.css && config.css.indexOf(css) !== -1) || (config.termCSS && config.termCSS.indexOf(css) !== -1)) {
+      deprecated.push(css);
+    }
+  });
+  return deprecated;
+};
+exports.getDeprecatedCSS = getDeprecatedCSS;
+
+const checkDeprecatedConfig = function() {
+  if (!cfg.config) {
+    return;
   }
+  const deprecated = getDeprecatedCSS(cfg.config);
+  if (deprecated.length === 0) {
+    return;
+  }
+  const deprecatedStr = deprecated.join(', ');
+  notify('Configuration warning', `Your configuration uses some deprecated CSS classes (${deprecatedStr})`);
+};
+
+exports.fixConfigDefaults = decoratedConfig => {
+  const defaultConfig = getDefaultConfig().config;
+  decoratedConfig.colors = getColorMap(decoratedConfig.colors) || {};
+  // We must have default colors for xterm css.
+  decoratedConfig.colors = Object.assign({}, defaultConfig.colors, decoratedConfig.colors);
+  return decoratedConfig;
+};
+
+exports.htermConfigTranslate = config => {
+  const cssReplacements = {
+    'x-screen x-row([ {.[])': '.xterm-rows > div$1',
+    '.cursor-node([ {.[])': '.terminal-cursor$1',
+    '::selection([ {.[])': '.terminal .xterm-selection div$1',
+    'x-screen a([ {.[])': '.terminal a$1',
+    'x-row a([ {.[])': '.terminal a$1'
+  };
+  Object.keys(cssReplacements).forEach(pattern => {
+    const searchvalue = new RegExp(pattern, 'g');
+    const newvalue = cssReplacements[pattern];
+    config.css = config.css && config.css.replace(searchvalue, newvalue);
+    config.termCSS = config.termCSS && config.termCSS.replace(searchvalue, newvalue);
+  });
+  return config;
 };
